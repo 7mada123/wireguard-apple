@@ -56,6 +56,17 @@ public class WireGuardAdapter {
     /// Adapter state.
     private var state: State = .stopped
 
+    /// Guards `isStarting`, `stopRequestedDuringStart` and `pendingStopCompletion` below.
+    /// These let `stop()` interrupt an in-flight `start()` instead of queuing behind it on
+    /// `workQueue`, which is what made disconnecting while still connecting slow: `start()`
+    /// blocks that queue for seconds at a time (DNS resolution, then up to a 5s wait on
+    /// `setTunnelNetworkSettings`), so a `stop()` submitted to the same queue couldn't run
+    /// until `start()` fully finished.
+    private let lifecycleLock = NSLock()
+    private var isStarting = false
+    private var stopRequestedDuringStart = false
+    private var pendingStopCompletion: ((WireGuardAdapterError?) -> Void)?
+
     /// Tunnel device file descriptor.
     private var tunnelFileDescriptor: Int32? {
         var ctlInfo = ctl_info()
@@ -175,9 +186,19 @@ public class WireGuardAdapter {
     ///   - tunnelConfiguration: tunnel configuration.
     ///   - completionHandler: completion handler.
     public func start(tunnelConfiguration: TunnelConfiguration, completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+        lifecycleLock.lock()
+        isStarting = true
+        stopRequestedDuringStart = false
+        lifecycleLock.unlock()
+
         workQueue.async {
             guard case .stopped = self.state else {
+                self.finishStarting(tearDownHandle: nil)
                 completionHandler(.invalidState)
+                return
+            }
+
+            if self.abortStartIfStopRequested(completionHandler) {
                 return
             }
 
@@ -186,22 +207,39 @@ public class WireGuardAdapter {
                 self?.didReceivePathUpdate(path: path)
             }
             networkMonitor.start(queue: self.workQueue)
+            self.networkMonitor = networkMonitor
 
             do {
                 let settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
-                try self.setNetworkSettings(settingsGenerator.generateNetworkSettings())
+
+                if self.abortStartIfStopRequested(completionHandler) {
+                    return
+                }
+
+                try self.setNetworkSettings(
+                    settingsGenerator.generateNetworkSettings(),
+                    isCancelled: { [weak self] in self?.isStopRequestedDuringStart() ?? false }
+                )
+
+                if self.abortStartIfStopRequested(completionHandler) {
+                    return
+                }
 
                 let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
 
-                self.state = .started(
-                    try self.startWireGuardBackend(wgConfig: wgConfig),
-                    settingsGenerator
-                )
-                self.networkMonitor = networkMonitor
+                let handle = try self.startWireGuardBackend(wgConfig: wgConfig)
+                self.state = .started(handle, settingsGenerator)
+
+                // A stop() may have raced in while wgTurnOn() was running; finishStarting tears
+                // the tunnel back down immediately in that case rather than leaving it up.
+                self.finishStarting(tearDownHandle: handle)
                 completionHandler(nil)
             } catch let error as WireGuardAdapterError {
-                networkMonitor.cancel()
+                self.networkMonitor?.cancel()
+                self.networkMonitor = nil
+                self.state = .stopped
+                self.finishStarting(tearDownHandle: nil)
                 completionHandler(error)
             } catch {
                 fatalError()
@@ -212,6 +250,21 @@ public class WireGuardAdapter {
     /// Stop the tunnel.
     /// - Parameter completionHandler: completion handler.
     public func stop(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+        lifecycleLock.lock()
+        if isStarting {
+            // start() is currently running on workQueue — possibly blocked in DNS resolution or
+            // waiting on setTunnelNetworkSettings. Flag it for cancellation instead of queuing
+            // behind it: start() polls this flag at each checkpoint and tears itself down as
+            // soon as it next checks in, rather than only after fully completing.
+            stopRequestedDuringStart = true
+            let previousPendingStop = pendingStopCompletion
+            pendingStopCompletion = completionHandler
+            lifecycleLock.unlock()
+            previousPendingStop?(.invalidState)
+            return
+        }
+        lifecycleLock.unlock()
+
         workQueue.async {
             switch self.state {
             case .started(let handle, _):
@@ -232,6 +285,53 @@ public class WireGuardAdapter {
 
             completionHandler(nil)
         }
+    }
+
+    /// Tears down any partial start state (network monitor only — the WireGuard backend hasn't
+    /// come up yet at any of these checkpoints) and completes both the in-flight start and any
+    /// stop() deferred behind it.
+    /// - Returns: `true` if a stop was pending and the start was aborted.
+    @discardableResult
+    private func abortStartIfStopRequested(_ startCompletionHandler: @escaping (WireGuardAdapterError?) -> Void) -> Bool {
+        guard isStopRequestedDuringStart() else { return false }
+
+        self.networkMonitor?.cancel()
+        self.networkMonitor = nil
+        self.state = .stopped
+
+        self.finishStarting(tearDownHandle: nil)
+        startCompletionHandler(nil)
+        return true
+    }
+
+    private func isStopRequestedDuringStart() -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return stopRequestedDuringStart
+    }
+
+    /// Marks the in-flight start as finished. If a stop() arrived while it was running, tears
+    /// down `tearDownHandle` (if the backend had already come up) and completes the deferred
+    /// stop.
+    private func finishStarting(tearDownHandle: Int32?) {
+        lifecycleLock.lock()
+        let shouldTearDown = stopRequestedDuringStart
+        isStarting = false
+        stopRequestedDuringStart = false
+        let pendingStop = pendingStopCompletion
+        pendingStopCompletion = nil
+        lifecycleLock.unlock()
+
+        if shouldTearDown {
+            if let handle = tearDownHandle {
+                wgTurnOff(handle)
+            }
+            self.networkMonitor?.cancel()
+            self.networkMonitor = nil
+            self.state = .stopped
+        }
+
+        pendingStop?(nil)
     }
 
     /// Update runtime configuration.
@@ -309,9 +409,11 @@ public class WireGuardAdapter {
     ///
     /// - Parameters:
     ///   - networkSettings: an instance of type `NEPacketTunnelNetworkSettings`.
+    ///   - isCancelled: polled between wait slices; returning `true` aborts the wait early so a
+    ///     concurrent stop() doesn't have to sit through the full timeout.
     /// - Throws: an error of type `WireGuardAdapterError`.
     /// - Returns: `PacketTunnelSettingsGenerator`.
-    private func setNetworkSettings(_ networkSettings: NEPacketTunnelNetworkSettings) throws {
+    private func setNetworkSettings(_ networkSettings: NEPacketTunnelNetworkSettings, isCancelled: () -> Bool = { false }) throws {
         var systemError: Error?
         let condition = NSCondition()
 
@@ -325,16 +427,26 @@ public class WireGuardAdapter {
         }
 
         // Packet tunnel's `setTunnelNetworkSettings` times out in certain
-        // scenarios & never calls the given callback.
+        // scenarios & never calls the given callback. Wait in short slices, polling
+        // `isCancelled` between them, instead of blocking for the full timeout in one shot.
         let setTunnelNetworkSettingsTimeout: TimeInterval = 5 // seconds
+        let pollInterval: TimeInterval = 0.1 // seconds
+        let deadline = Date().addingTimeInterval(setTunnelNetworkSettingsTimeout)
 
-        if condition.wait(until: Date().addingTimeInterval(setTunnelNetworkSettingsTimeout)) {
-            if let systemError = systemError {
-                throw WireGuardAdapterError.setNetworkSettings(systemError)
+        while Date() < deadline {
+            if isCancelled() {
+                self.logHandler(.verbose, "setTunnelNetworkSettings wait interrupted by a pending stop")
+                return
             }
-        } else {
-            self.logHandler(.error, "setTunnelNetworkSettings timed out after 5 seconds; proceeding anyway")
+            if condition.wait(until: min(Date().addingTimeInterval(pollInterval), deadline)) {
+                if let systemError = systemError {
+                    throw WireGuardAdapterError.setNetworkSettings(systemError)
+                }
+                return
+            }
         }
+
+        self.logHandler(.error, "setTunnelNetworkSettings timed out after 5 seconds; proceeding anyway")
     }
 
     /// Resolve peers of the given tunnel configuration.
